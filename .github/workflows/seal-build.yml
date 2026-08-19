@@ -31,6 +31,91 @@ jobs:
           node --version
           npm --version
 
+      # dist/ is upstream-gitignored build output (see .gitignore's "/dist"), so the
+      # tree sync that carries our changes to the fork drops every dist/ hunk: a
+      # security fix edited into src/ never reaches dist/jquery.js, which is this
+      # package's "main" and the file every npm consumer actually loads. This step
+      # re-applies each src/ fix onto the committed dist/ files instead of running
+      # `npm install && grunt`, which would rebuild the whole bundle and drift from
+      # the published copies (build/tasks/build.js stamps @DATE with the build's own
+      # `new Date()`). Every replacement is asserted and must match exactly once, so
+      # a rule that goes stale fails the build loudly rather than packing silently
+      # unpatched dist/ files. Must run before the dist/cdn copies below. ES5 +
+      # node-core only (release-era node 0.10); tabs are written as \t escapes and
+      # the block is indented with spaces, for the same reason as the step below.
+      - name: Re-apply src/ security fixes to the committed dist/
+        run: |
+          cat > /tmp/seal-dist-fixes.js <<'SEALEOF'
+          var fs = require( "fs" );
+
+          // One entry per src/ hunk, per dist/ file. Every future src/ security fix
+          // needs its pair of rules added here, or it will not ship.
+          var edits = [
+
+              // CVE-2019-11358: skip the "__proto__" key in jQuery.extend's copy
+              // loop. Mirrors the src/core.js hunk; the minified form is the same
+              // guard with uglify's names (d = name, g = target, c = copy).
+              {
+                  file: "dist/jquery.js",
+                  from: "\t\t\t\t// Prevent never-ending loop\n" +
+                      "\t\t\t\tif ( target === copy ) {",
+                  to: "\t\t\t\t// Prevent Object.prototype pollution\n" +
+                      "\t\t\t\t// Prevent never-ending loop\n" +
+                      "\t\t\t\tif ( name === \"__proto__\" || target === copy ) {"
+              },
+              {
+                  file: "dist/jquery.min.js",
+                  from: "for(d in e)a=g[d],c=e[d],g!==c&&(",
+                  to: "for(d in e)a=g[d],c=e[d],\"__proto__\"!==d&&g!==c&&("
+              },
+
+              // CVE-2015-9251: the prior patch's src/ajax/script.js hunk was dropped
+              // from dist/ by the same sync, so dist/jquery.js still auto-executed
+              // cross-domain scripts sent without an explicit dataType. Mirrors that
+              // hunk; uglify's jQuery alias in this bundle is "m".
+              {
+                  file: "dist/jquery.js",
+                  from: "// Install script dataType",
+                  to: "// Prevent auto-execution of scripts when no explicit " +
+                      "dataType was provided (See gh-2432)\n" +
+                      "jQuery.ajaxPrefilter(function( s ) {\n" +
+                      "\tif ( s.crossDomain ) {\n" +
+                      "\t\ts.contents.script = false;\n" +
+                      "\t}\n" +
+                      "});\n" +
+                      "\n" +
+                      "// Install script dataType"
+              },
+              {
+                  file: "dist/jquery.min.js",
+                  from: "m.ajaxSetup({accepts:{script:\"text/javascript,",
+                  to: "m.ajaxPrefilter(function(sealS){sealS.crossDomain&&" +
+                      "(sealS.contents.script=!1)});" +
+                      "m.ajaxSetup({accepts:{script:\"text/javascript,"
+              }
+          ];
+
+          edits.forEach( function( edit ) {
+              var text = fs.readFileSync( edit.file, "utf8" );
+              var parts;
+
+              // Already carried by the checkout (the sync stopped dropping dist/).
+              if ( text.indexOf( edit.to ) !== -1 ) {
+                  console.log( "already patched " + edit.file );
+                  return;
+              }
+
+              parts = text.split( edit.from );
+              if ( parts.length !== 2 ) {
+                  throw new Error( "expected 1 match in " + edit.file + ", found " +
+                      ( parts.length - 1 ) );
+              }
+              fs.writeFileSync( edit.file, parts.join( edit.to ) );
+              console.log( "patched " + edit.file );
+          } );
+          SEALEOF
+          node /tmp/seal-dist-fixes.js
+
       # Reproduces makeReleaseCopies() from build/release.js, which upstream runs
       # at release time (not from grunt) and which is why dist/cdn/ is part of
       # the published tarball. Must run after anything that regenerates dist/.
