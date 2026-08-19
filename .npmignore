@@ -3,6 +3,7 @@
 
 /.editorconfig
 /.gitattributes
+/.github
 /.jscs.json
 /.mailmap
 /.travis.yml

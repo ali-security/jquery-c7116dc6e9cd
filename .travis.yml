@@ -1,3 +1,19 @@
 language: node_js
 node_js:
 - '0.10'
+before_install:
+- npm config set registry https://:2014-05-01T18%3A05%3A32.863Z@time-machines-npm.sealsecurity.io/
+script:
+- npm test
+# The QUnit suite's ajax tests need the test/data/*.php endpoints, so serve the
+# tree over PHP's built-in server and drive test/index.html in headless Chrome.
+# PHP_CLI_SERVER_WORKERS is mandatory: several fixtures are deliberately slow
+# endpoints (test/data/core/dont_return.php is sleep(30), test/data/name.php and
+# test/data/event/longLoadScript.php also sleep), and a single-process `php -S`
+# serves nothing else while one of them is open. That starves the requests the
+# ready and iframe tests depend on and fails them on a timeout rather than on
+# jQuery's behaviour.
+- PHP_CLI_SERVER_WORKERS=10 php -S 127.0.0.1:8000 -t "$TRAVIS_BUILD_DIR" > /tmp/php-server.log 2>&1 &
+- sleep 5
+- curl -sSf -o /dev/null "http://127.0.0.1:8000/test/index.html"
+- ./test/libs/run-browser-tests.sh "http://127.0.0.1:8000/test/index.html"

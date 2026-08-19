@@ -1,0 +1,130 @@
+# Build-and-pack half of this package's split CI: the test suite runs on Travis
+# (.travis.yml), so this workflow only reproduces the published tarball.
+#
+# It deliberately does NOT run `npm run build` (`npm install && grunt`): the
+# dist/jquery.js, dist/jquery.min.js and dist/jquery.min.map committed at the
+# 1.11.1 tag are already byte-identical to the published tarball's copies, so
+# regenerating them would only risk drift. dist/cdn/ is the one published
+# directory grunt never produces -- upstream creates it in its release step --
+# so the step below reproduces that step here, before packing.
+name: seal-build
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  pack:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Node 0.10.28 (the runtime current at the 1.11.1 release)
+        run: |
+          curl -fsSL https://nodejs.org/dist/v0.10.28/node-v0.10.28-linux-x64.tar.gz -o /tmp/node.tar.gz
+          mkdir -p /opt/node
+          tar -xzf /tmp/node.tar.gz -C /opt/node --strip-components=1
+          echo "/opt/node/bin" >> "$GITHUB_PATH"
+
+      - name: Report toolchain
+        run: |
+          node --version
+          npm --version
+
+      # Reproduces makeReleaseCopies() from build/release.js, which upstream runs
+      # at release time (not from grunt) and which is why dist/cdn/ is part of
+      # the published tarball. Must run after anything that regenerates dist/.
+      # Inlined here rather than committed as build/seal-cdn-copies.js because
+      # the version patch that carries our changes to the fork excludes build/.
+      # ES5 + node-core only, so it runs on the release-era node 0.10 with no
+      # npm install (release.js itself needs shelljs). Indented with spaces, not
+      # tabs: the patch apply that lands this on the fork strips a space-before-
+      # tab indent, which would corrupt the YAML block scalar.
+      - name: Generate dist/cdn release copies
+        run: |
+          cat > /tmp/seal-cdn-copies.js <<'SEALEOF'
+          var fs = require( "fs" );
+          var path = require( "path" );
+
+          var root = process.cwd();
+
+          var version = JSON.parse(
+              fs.readFileSync( path.join( root, "package.json" ), "utf8" )
+          ).version;
+
+          var devFile = "dist/jquery.js";
+          var minFile = "dist/jquery.min.js";
+          var mapFile = "dist/jquery.min.map";
+
+          var cdnFolder = "dist/cdn";
+
+          // Same table as build/release.js; VER is substituted with the version.
+          var releaseFiles = {
+              "jquery-VER.js": devFile,
+              "jquery-VER.min.js": minFile,
+              "jquery-VER.min.map": mapFile,
+              "jquery.js": devFile,
+              "jquery.min.js": minFile,
+              "jquery.min.map": mapFile,
+              "jquery-latest.js": devFile,
+              "jquery-latest.min.js": minFile,
+              "jquery-latest.min.map": mapFile
+          };
+
+          function mkdirp( dir ) {
+              var parent = path.dirname( dir );
+              if ( parent !== dir && !fs.existsSync( parent ) ) {
+                  mkdirp( parent );
+              }
+              if ( !fs.existsSync( dir ) ) {
+                  fs.mkdirSync( dir );
+              }
+          }
+
+          mkdirp( path.join( root, cdnFolder ) );
+
+          Object.keys( releaseFiles ).forEach( function( key ) {
+              var text,
+                  builtFile = releaseFiles[ key ],
+                  unpathedFile = key.replace( /VER/g, version ),
+                  releaseFile = cdnFolder + "/" + unpathedFile,
+                  builtPath = path.join( root, builtFile ),
+                  releasePath = path.join( root, releaseFile );
+
+              if ( /\.map$/.test( releaseFile ) ) {
+
+                  // Map files need to reference the new uncompressed name;
+                  // assume that all files reside in the same directory.
+                  // "file":"jquery.min.js","sources":["jquery.js"]
+                  text = fs.readFileSync( builtPath, "utf8" )
+                      .replace( /"file":"([^"]+)","sources":\["([^"]+)"\]/,
+                          "\"file\":\"" + unpathedFile.replace( /\.min\.map/, ".min.js" ) +
+                          "\",\"sources\":[\"" + unpathedFile.replace( /\.min\.map/, ".js" ) + "\"]" );
+                  fs.writeFileSync( releasePath, text );
+              } else if ( /\.min\.js$/.test( releaseFile ) ) {
+
+                  // Remove the source map comment; it causes way too many problems.
+                  // Keep the map file in case DevTools allow manual association.
+                  text = fs.readFileSync( builtPath, "utf8" )
+                      .replace( /\/\/# sourceMappingURL=\S+/, "" );
+                  fs.writeFileSync( releasePath, text );
+              } else if ( builtFile !== releaseFile ) {
+                  fs.writeFileSync( releasePath, fs.readFileSync( builtPath ) );
+              }
+
+              console.log( "wrote " + releaseFile );
+          } );
+          SEALEOF
+          node /tmp/seal-cdn-copies.js
+
+      - name: Report artifact checksums
+        run: md5sum dist/jquery.js dist/jquery.min.js dist/jquery.min.map dist/cdn/*
+
+      - name: Pack
+        run: npm pack
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: npm-tarball
+          path: jquery-1.11.1.tgz
+          if-no-files-found: error
